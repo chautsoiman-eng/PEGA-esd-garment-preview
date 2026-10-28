@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Preview</title>
+<style>
+  :root { --bg: #f4f4f2; --card: #fff; --text: #1d2433; --muted: #6b7280; --line: #d9dbe0; --accent: #1f3a5f; --error: #b42318; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15181e; --card: #1e232b; --text: #e8eaee; --muted: #9aa3af; --line: #343b46; --accent: #8fb3e0; --error: #f97066; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif; }
+  form { width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 28px 24px; }
+  h1 { margin: 0 0 4px; font-size: 18px; }
+  p { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; font: inherit; }
+  button { width: 100%; margin-top: 12px; padding: 10px; border: 0; border-radius: 8px; background: var(--accent); color: var(--card); font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #status { min-height: 20px; margin-top: 12px; font-size: 13px; color: var(--muted); }
+  #status.error { color: var(--error); }
+</style>
+</head>
+<body>
+<form id="form" autocomplete="off">
+  <h1>此頁面受密碼保護</h1>
+  <p>請輸入密碼以開啟預覽。</p>
+  <input id="password" type="password" placeholder="密碼" autofocus required>
+  <button id="submit" type="submit">開啟</button>
+  <div id="status" role="status"></div>
+</form>
+<script>
+(() => {
+  const config = {"salt":"pega-esd-garment-preview-v1","iterations":600000,"modelToken":"__PREVIEW_MODEL_URL__","page":"page.bin?v=122ccb9186ee9fa0","model":"../model.bin?v=ae96f3a76262aedd"};
+  const storageKey = 'preview-key';
+  const form = document.getElementById('form');
+  const input = document.getElementById('password');
+  const button = document.getElementById('submit');
+  const status = document.getElementById('status');
+  let modelProgress = 0;
+
+  function setStatus(text, isError) {
+    status.textContent = text;
+    status.className = isError ? 'error' : '';
+  }
+  async function download(url, onProgress) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const total = Number(res.headers.get('Content-Length')) || 0;
+    if (!res.body || !total || !onProgress) return new Uint8Array(await res.arrayBuffer());
+    const out = new Uint8Array(total);
+    const reader = res.body.getReader();
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out.set(value, received);
+      received += value.length;
+      onProgress(received / total);
+    }
+    return out.subarray(0, received);
+  }
+  const pageData = download(config.page);
+  const modelData = download(config.model, (p) => { modelProgress = p; });
+  pageData.catch(() => {});
+  modelData.catch(() => {});
+
+  async function deriveKey(password) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(config.salt), iterations: config.iterations }, base, 512);
+    return new Uint8Array(bits).slice(0, 32);
+  }
+  async function decrypt(raw, data) {
+    const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+    return crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.subarray(0, 12) }, key, data.subarray(12));
+  }
+  async function open(raw) {
+    setStatus('解密頁面…');
+    let html;
+    try {
+      html = new TextDecoder().decode(await decrypt(raw, await pageData));
+    } catch (e) {
+      if (e && e.name === 'OperationError') return false;
+      throw e;
+    }
+    try { sessionStorage.setItem(storageKey, btoa(String.fromCharCode(...raw))); } catch (e) {}
+    const timer = setInterval(() => setStatus('下載 3D 模型… ' + Math.round(modelProgress * 100) + '%'), 300);
+    let model;
+    try { model = await modelData; } finally { clearInterval(timer); }
+    setStatus('解密 3D 模型…');
+    const url = URL.createObjectURL(new Blob([await decrypt(raw, model)], { type: 'model/gltf-binary' }));
+    document.open();
+    document.write(html.split(config.modelToken).join(url));
+    document.close();
+    return true;
+  }
+  async function unlock(raw) {
+    button.disabled = true;
+    try {
+      if (await open(raw)) return;
+      try { sessionStorage.removeItem(storageKey); } catch (e) {}
+      setStatus('密碼錯誤，請再試一次。', true);
+    } catch (e) {
+      setStatus('載入失敗：' + (e && e.message ? e.message : e) + '。請重新整理頁面。', true);
+    }
+    button.disabled = false;
+    input.select();
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    button.disabled = true;
+    setStatus('驗證密碼…');
+    unlock(await deriveKey(input.value));
+  });
+  let saved = null;
+  try { saved = sessionStorage.getItem(storageKey); } catch (e) {}
+  if (saved) unlock(Uint8Array.from(atob(saved), (c) => c.charCodeAt(0)));
+})();
+</script>
+</body>
+</html>
